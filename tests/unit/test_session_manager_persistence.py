@@ -16,6 +16,7 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+from agent.core.model_ids import DEFAULT_MODEL_ID, KIMI_K26_MODEL_ID  # noqa: E402
 from agent.core.session_persistence import NoopSessionStore  # noqa: E402
 from session_manager import AgentSession, SessionManager  # noqa: E402
 
@@ -105,6 +106,8 @@ def _manager_with_store(store: NoopSessionStore) -> SessionManager:
     manager._lock = asyncio.Lock()
     manager.persistence_store = store
     manager.messaging_gateway = CloseableResource()
+    manager._pending_creates = 0
+    manager._reaper_task = None
     return manager
 
 
@@ -123,6 +126,34 @@ def _runtime_agent_session(
         user_id=user_id,
         hf_token=hf_token,
     )
+
+
+def test_unknown_saved_model_defaults_to_claude():
+    model, premium_user_billed, claude_counted = (
+        SessionManager._model_from_saved_metadata(
+            "unsupported/model",
+            premium_user_billed=False,
+            claude_counted=False,
+        )
+    )
+
+    assert model == DEFAULT_MODEL_ID
+    assert premium_user_billed is False
+    assert claude_counted is False
+
+
+def test_unknown_saved_user_billed_model_defaults_to_free_model():
+    model, premium_user_billed, claude_counted = (
+        SessionManager._model_from_saved_metadata(
+            "unsupported/model",
+            premium_user_billed=True,
+            claude_counted=True,
+        )
+    )
+
+    assert model == KIMI_K26_MODEL_ID
+    assert premium_user_billed is False
+    assert claude_counted is False
 
 
 @pytest.mark.asyncio
@@ -207,7 +238,7 @@ async def test_close_cancels_preload_and_deletes_owned_sandbox(monkeypatch):
     session.sandbox = SimpleNamespace(
         space_id="owner/sandbox-12345678",
         _owns_space=True,
-        delete=lambda: deleted.append("owner/sandbox-12345678"),
+        delete=lambda log=None: deleted.append("owner/sandbox-12345678"),
     )
     session.sandbox_hardware = "cpu-basic"
     session.sandbox_preload_cancel_event = preload_cancel_event
@@ -425,6 +456,9 @@ async def test_create_session_schedules_cpu_sandbox_preload():
 
         assert scheduled == [session_id]
         assert session_id in manager.sessions
+        runtime_session = manager.sessions[session_id].session
+        assert not hasattr(runtime_session, "_ml_intern_artifact_collection_task")
+        assert not hasattr(runtime_session, "_ml_intern_artifact_collection_slug")
     finally:
         stop.set()
         await _cancel_runtime_tasks(manager)
@@ -449,6 +483,8 @@ async def test_lazy_restore_schedules_cpu_sandbox_preload():
         assert restored is not None
         assert scheduled == ["persisted-session"]
         assert "persisted-session" in manager.sessions
+        assert not hasattr(restored.session, "_ml_intern_artifact_collection_task")
+        assert not hasattr(restored.session, "_ml_intern_artifact_collection_slug")
     finally:
         stop.set()
         await _cancel_runtime_tasks(manager)
@@ -622,6 +658,87 @@ async def test_lazy_restore_preserves_auto_approval_policy():
 
 
 @pytest.mark.asyncio
+async def test_lazy_restore_injects_sandbox_reset_note_when_session_had_sandbox():
+    store = RestoreStore(
+        metadata={
+            "session_id": "had-sandbox",
+            "user_id": "owner",
+            "model": "test-model",
+            "sandbox_status": "destroyed",
+        }
+    )
+    manager = _manager_with_store(store)
+    stop = _install_fake_runtime(manager)
+
+    try:
+        restored = await manager.ensure_session_loaded("had-sandbox", user_id="owner")
+
+        assert restored is not None
+        items = restored.session.context_manager.items
+        assert len(items) == 1
+        assert "sandbox was reset" in items[0].content
+    finally:
+        stop.set()
+        await _cancel_runtime_tasks(manager)
+
+
+@pytest.mark.asyncio
+async def test_lazy_restore_skips_sandbox_reset_note_when_no_sandbox():
+    store = RestoreStore(
+        metadata={
+            "session_id": "no-sandbox",
+            "user_id": "owner",
+            "model": "test-model",
+        }
+    )
+    manager = _manager_with_store(store)
+    stop = _install_fake_runtime(manager)
+
+    try:
+        restored = await manager.ensure_session_loaded("no-sandbox", user_id="owner")
+
+        assert restored is not None
+        assert restored.session.context_manager.items == []
+    finally:
+        stop.set()
+        await _cancel_runtime_tasks(manager)
+
+
+@pytest.mark.asyncio
+async def test_lazy_restore_skips_sandbox_note_when_pending_approval():
+    """The sandbox-reset note must be skipped when an approval is pending: it
+    would land between the restored assistant tool-calls and their results,
+    orphaning the tool results on approval (the provider rejects the ordering)."""
+    store = RestoreStore(
+        metadata={
+            "session_id": "had-sandbox-pending",
+            "user_id": "owner",
+            "model": "test-model",
+            "sandbox_status": "destroyed",
+            "pending_approval": [
+                {"tool": "bash", "tool_call_id": "call_1", "arguments": {}}
+            ],
+        }
+    )
+    manager = _manager_with_store(store)
+    stop = _install_fake_runtime(manager)
+
+    try:
+        restored = await manager.ensure_session_loaded(
+            "had-sandbox-pending", user_id="owner"
+        )
+
+        assert restored is not None
+        items = restored.session.context_manager.items
+        assert not any("sandbox was reset" in getattr(m, "content", "") for m in items)
+        # The pending approval itself is still restored.
+        assert restored.session.pending_approval is not None
+    finally:
+        stop.set()
+        await _cancel_runtime_tasks(manager)
+
+
+@pytest.mark.asyncio
 async def test_list_sessions_dev_uses_store_dev_visibility():
     class ListStore(NoopSessionStore):
         enabled = True
@@ -638,6 +755,8 @@ async def test_list_sessions_dev_uses_store_dev_visibility():
                         "user_id": "alice",
                         "model": "m",
                         "created_at": datetime.now(UTC),
+                        "premium_user_billed": True,
+                        "claude_counted": True,
                         "auto_approval_enabled": True,
                         "auto_approval_cost_cap_usd": 5.0,
                         "auto_approval_estimated_spend_usd": 2.0,
@@ -659,6 +778,8 @@ async def test_list_sessions_dev_uses_store_dev_visibility():
     assert store.seen_user_id == "dev"
     assert {session["session_id"] for session in sessions} == {"s1", "s2"}
     yolo = next(session for session in sessions if session["session_id"] == "s1")
+    assert yolo["premium_user_billed"] is True
+    assert yolo["premium_quota_counted"] is True
     assert yolo["auto_approval"] == {
         "enabled": True,
         "cost_cap_usd": 5.0,

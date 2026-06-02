@@ -1,4 +1,4 @@
-"""Tests for backend/user_quotas.py — the in-memory Claude daily-quota store."""
+"""Tests for backend/user_quotas.py — the in-memory premium quota store."""
 
 import asyncio
 import sys
@@ -27,16 +27,13 @@ def _reset_store():
 def test_daily_cap_for_known_plans():
     assert user_quotas.daily_cap_for("free") == user_quotas.CLAUDE_FREE_DAILY
     assert user_quotas.daily_cap_for("pro") == user_quotas.CLAUDE_PRO_DAILY
-    assert user_quotas.daily_cap_for("org") == user_quotas.CLAUDE_PRO_DAILY
+    assert user_quotas.daily_cap_for("org") == user_quotas.CLAUDE_FREE_DAILY
 
 
 def test_daily_cap_for_unknown_or_missing_defaults_to_free():
     assert user_quotas.daily_cap_for(None) == user_quotas.CLAUDE_FREE_DAILY
     assert user_quotas.daily_cap_for("") == user_quotas.CLAUDE_FREE_DAILY
-    # Anything we don't recognize as the Pro/Org tier gets the Pro cap because
-    # the function's contract is "free" is the only downgraded tier. If that
-    # ever flips, this test will flip too — adjust consciously.
-    assert user_quotas.daily_cap_for("mystery") == user_quotas.CLAUDE_PRO_DAILY
+    assert user_quotas.daily_cap_for("mystery") == user_quotas.CLAUDE_FREE_DAILY
 
 
 @pytest.mark.asyncio
@@ -124,11 +121,13 @@ async def test_refund_on_stale_day_resets_rather_than_underflow():
 
 
 @pytest.mark.asyncio
-async def test_free_user_cap_reached_at_one():
+async def test_free_user_cap_reached_at_two():
     cap = user_quotas.daily_cap_for("free")
+    assert cap == 2
+    assert await user_quotas.increment_claude("freebie") == 1
     used = await user_quotas.increment_claude("freebie")
-    assert used == 1
-    assert used >= cap  # first bump exhausts the free tier (cap=1)
+    assert used == 2
+    assert used >= cap
 
 
 @pytest.mark.asyncio

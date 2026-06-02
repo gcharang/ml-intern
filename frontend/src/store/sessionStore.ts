@@ -13,6 +13,10 @@ interface SessionStore {
   deleteSession: (id: string) => void;
   switchSession: (id: string) => void;
   setSessionActive: (id: string, isActive: boolean) => void;
+  /** Track whether this session is mid-turn. Set false on terminal events so a
+   *  finished background task stops looking "processing" (which would otherwise
+   *  keep reactivating it until the next GET /sessions merge). */
+  setSessionProcessing: (id: string, isProcessing: boolean) => void;
   updateSessionTitle: (id: string, title: string) => void;
   updateSessionModel: (id: string, model: string | null) => void;
   setNeedsAttention: (id: string, needs: boolean) => void;
@@ -27,7 +31,10 @@ interface SessionStore {
     title?: string | null;
     created_at: string;
     is_active?: boolean;
+    is_processing?: boolean;
     model?: string | null;
+    premium_user_billed?: boolean;
+    premium_quota_counted?: boolean;
     pending_approval?: unknown[] | null;
     auto_approval?: {
       enabled?: boolean;
@@ -66,6 +73,8 @@ export const useSessionStore = create<SessionStore>()(
           autoApprovalCostCapUsd: null,
           autoApprovalEstimatedSpendUsd: 0,
           autoApprovalRemainingUsd: null,
+          premiumUserBilled: false,
+          premiumQuotaCounted: false,
         };
         set((state) => ({
           sessions: [...state.sessions, newSession],
@@ -117,7 +126,10 @@ export const useSessionStore = create<SessionStore>()(
                 ...existing,
                 title: server.title || existing.title,
                 isActive: server.is_active ?? existing.isActive,
+                isProcessing: Boolean(server.is_processing),
                 model: server.model ?? existing.model ?? null,
+                premiumUserBilled: Boolean(server.premium_user_billed),
+                premiumQuotaCounted: Boolean(server.premium_quota_counted),
                 needsAttention: Boolean(server.pending_approval?.length) || existing.needsAttention,
                 expired: false,
                 ...(auto
@@ -139,6 +151,7 @@ export const useSessionStore = create<SessionStore>()(
               title: server.title || `Chat ${merged.length + 1}`,
               createdAt: server.created_at || new Date().toISOString(),
               isActive: server.is_active ?? true,
+              isProcessing: Boolean(server.is_processing),
               needsAttention: Boolean(server.pending_approval?.length),
               model: server.model ?? null,
               expired: false,
@@ -146,6 +159,8 @@ export const useSessionStore = create<SessionStore>()(
               autoApprovalCostCapUsd: server.auto_approval?.cost_cap_usd ?? null,
               autoApprovalEstimatedSpendUsd: server.auto_approval?.estimated_spend_usd ?? 0,
               autoApprovalRemainingUsd: server.auto_approval?.remaining_usd ?? null,
+              premiumUserBilled: Boolean(server.premium_user_billed),
+              premiumQuotaCounted: Boolean(server.premium_quota_counted),
             };
             merged.push(newSession);
             byId.set(id, newSession);
@@ -202,6 +217,14 @@ export const useSessionStore = create<SessionStore>()(
         }));
       },
 
+      setSessionProcessing: (id: string, isProcessing: boolean) => {
+        set((state) => ({
+          sessions: state.sessions.map((s) =>
+            s.id === id ? { ...s, isProcessing } : s
+          ),
+        }));
+      },
+
       updateSessionTitle: (id: string, title: string) => {
         set((state) => ({
           sessions: state.sessions.map((s) =>
@@ -229,7 +252,10 @@ export const useSessionStore = create<SessionStore>()(
     {
       name: 'hf-agent-sessions',
       partialize: (state) => ({
-        sessions: state.sessions,
+        // Reset the transient isProcessing flag so a stale `true` from a
+        // previous session can't trigger a reactivating hydration on the next
+        // cold load — it's always re-derived from the live GET /sessions list.
+        sessions: state.sessions.map((s) => ({ ...s, isProcessing: false })),
         activeSessionId: state.activeSessionId,
       }),
     }

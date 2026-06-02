@@ -11,6 +11,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
+from litellm import Message
+
 from agent.config import Config
 from agent.context_manager.manager import ContextManager
 from agent.messaging.gateway import NotificationGateway
@@ -21,16 +23,16 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_TOKENS = 200_000
 _TURN_COMPLETE_NOTIFICATION_CHARS = 39000
 
+DEFAULT_SESSION_LOG_DIR = Path("session_logs")
+
 
 def _get_max_tokens_safe(model_name: str) -> int:
     """Return the max input-context tokens for a model.
 
-    Primary source: ``litellm.get_model_info(model)['max_input_tokens']`` —
-    LiteLLM maintains an upstream catalog that knows Claude Opus 4.6 is
-    1M, GPT-5 is 272k, Sonnet 4.5 is 200k, and so on. Strips any HF routing
-    suffix / huggingface/ prefix so tagged ids ('moonshotai/Kimi-K2.6:cheapest')
-    look up the bare model. Falls back to a conservative 200k default for
-    models not in the catalog (typically HF-router-only models).
+    Primary source: ``litellm.get_model_info(model)['max_input_tokens']``.
+    Strips any HF routing suffix / huggingface/ prefix so tagged ids
+    ('moonshotai/Kimi-K2.6:cheapest') look up the bare model. Falls back to a
+    conservative 200k default for models not in the catalog.
     """
     from litellm import get_model_info
 
@@ -60,6 +62,8 @@ class OpType(Enum):
     INTERRUPT = "interrupt"
     UNDO = "undo"
     COMPACT = "compact"
+    NEW = "new"
+    RESUME = "resume"
     SHUTDOWN = "shutdown"
 
 
@@ -96,6 +100,7 @@ class Session:
         self.hf_token: Optional[str] = hf_token
         self.user_id: Optional[str] = user_id
         self.hf_username: Optional[str] = hf_username
+        self.local_mode = local_mode
         self.persistence_store = persistence_store
         self.tool_router = tool_router
         self.stream = stream
@@ -114,6 +119,12 @@ class Session:
         self.session_id = session_id or str(uuid.uuid4())
         self.config = config
         self.is_running = True
+        # Billing mode for premium HF Router usage. The backend quota gate
+        # flips this on once the user is past their subsidized daily allowance,
+        # so the LLM call bills the user's own HF token instead of the Space.
+        # Persisted with the session so it survives idle-reclaim.
+        self.premium_user_billed: bool = False
+        self.current_plan: list[dict[str, str]] = []
         self._cancelled = asyncio.Event()
         self.pending_approval: Optional[dict[str, Any]] = None
         self.sandbox = None
@@ -317,8 +328,11 @@ class Session:
 
     def update_model(self, model_name: str) -> None:
         """Switch the active model and update the context window limit."""
-        self.config.model_name = model_name
-        self.context_manager.model_max_tokens = _get_max_tokens_safe(model_name)
+        from agent.core.model_ids import strip_huggingface_model_prefix
+
+        normalized = strip_huggingface_model_prefix(model_name) or model_name
+        self.config.model_name = normalized
+        self.context_manager.model_max_tokens = _get_max_tokens_safe(normalized)
 
     def set_auto_approval_policy(
         self, *, enabled: bool, cost_cap_usd: float | None
@@ -371,6 +385,82 @@ class Session:
         """Increment turn counter (called after each user interaction)"""
         self.turn_count += 1
 
+    def start_new_conversation(self) -> dict[str, Any]:
+        """Rotate this runtime into a fresh conversation.
+
+        The tool router, model/config choices, user identity, and external
+        resources stay attached to the CLI process. Conversation-specific state
+        gets reset so later saves do not merge with the prior chat. Warm runtime
+        resources such as the sandbox, in-flight job tracking, and probed
+        model-effort cache are deliberately preserved.
+        """
+        previous_session_id = self.session_id
+        previous_turn_count = self.turn_count
+        previous_message_count = len(self.context_manager.items)
+        previous_non_system_count = sum(
+            1
+            for item in self.context_manager.items
+            if getattr(item, "role", None) != "system"
+        )
+
+        saved_path: str | None = None
+        if self.config.save_sessions and previous_non_system_count:
+            saved_path = self.save_and_upload_detached(self.config.session_dataset_repo)
+
+        from agent.tools.plan_tool import reset_current_plan
+
+        self.current_plan = []
+        reset_current_plan()
+
+        system_msg = self._fresh_system_message()
+        self.context_manager.items = [system_msg] if system_msg is not None else []
+        self.context_manager.running_context_usage = 0
+
+        self.session_id = str(uuid.uuid4())
+        self.session_start_time = datetime.now().isoformat()
+        self.turn_count = 0
+        self.last_auto_save_turn = 0
+        self.logged_events = []
+        self._local_save_path = None
+        self._last_heartbeat_ts = None
+        self.pending_approval = None
+        self.auto_approval_estimated_spend_usd = 0.0
+        self.reset_cancel()
+
+        # Previous-session metadata is intentionally included for event
+        # consumers and telemetry, even though the CLI currently prints only
+        # the optional save path.
+        return {
+            "session_id": self.session_id,
+            "previous_session_id": previous_session_id,
+            "previous_turn_count": previous_turn_count,
+            "previous_message_count": previous_message_count,
+            "saved_path": saved_path,
+        }
+
+    def _fresh_system_message(self) -> Message | None:
+        existing = (
+            self.context_manager.items[0]
+            if self.context_manager.items
+            and getattr(self.context_manager.items[0], "role", None) == "system"
+            else None
+        )
+        refresh = getattr(self.context_manager, "refresh_system_prompt", None)
+        if refresh is None:
+            return existing
+        try:
+            tool_specs = (
+                self.tool_router.get_tool_specs_for_llm() if self.tool_router else []
+            )
+            return refresh(
+                tool_specs=tool_specs,
+                hf_token=self.hf_token,
+                local_mode=self.local_mode,
+            )
+        except Exception as e:
+            logger.warning("Failed to refresh system prompt for new chat: %s", e)
+            return existing
+
     async def auto_save_if_needed(self) -> None:
         """Check if auto-save should trigger and save if so (completely non-blocking)"""
         if not self.config.save_sessions:
@@ -418,7 +508,7 @@ class Session:
 
     def save_trajectory_local(
         self,
-        directory: str = "session_logs",
+        directory: str = str(DEFAULT_SESSION_LOG_DIR),
         upload_status: str = "pending",
         dataset_url: Optional[str] = None,
     ) -> Optional[str]:
@@ -613,7 +703,7 @@ class Session:
 
     @staticmethod
     def retry_failed_uploads_detached(
-        directory: str = "session_logs",
+        directory: str = str(DEFAULT_SESSION_LOG_DIR),
         repo_id: Optional[str] = None,
         *,
         personal_repo_id: Optional[str] = None,

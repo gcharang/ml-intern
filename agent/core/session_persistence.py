@@ -175,6 +175,7 @@ class MongoSessionStore(NoopSessionStore):
         turn_count: int = 0,
         pending_approval: list[dict[str, Any]] | None = None,
         claude_counted: bool = False,
+        premium_user_billed: bool = False,
         notification_destinations: list[str] | None = None,
         auto_approval_enabled: bool = False,
         auto_approval_cost_cap_usd: float | None = None,
@@ -206,6 +207,7 @@ class MongoSessionStore(NoopSessionStore):
                     "turn_count": turn_count,
                     "pending_approval": pending_approval or [],
                     "claude_counted": claude_counted,
+                    "premium_user_billed": premium_user_billed,
                     "notification_destinations": notification_destinations or [],
                     "auto_approval_enabled": auto_approval_enabled,
                     "auto_approval_cost_cap_usd": auto_approval_cost_cap_usd,
@@ -228,13 +230,17 @@ class MongoSessionStore(NoopSessionStore):
         turn_count: int = 0,
         pending_approval: list[dict[str, Any]] | None = None,
         claude_counted: bool = False,
+        premium_user_billed: bool = False,
         created_at: datetime | None = None,
         notification_destinations: list[str] | None = None,
         auto_approval_enabled: bool = False,
         auto_approval_cost_cap_usd: float | None = None,
         auto_approval_estimated_spend_usd: float = 0.0,
+        raise_on_error: bool = False,
     ) -> None:
         if not self._ready():
+            if raise_on_error:
+                raise RuntimeError("session store not ready")
             return
         now = _now()
         await self.upsert_session(
@@ -249,6 +255,7 @@ class MongoSessionStore(NoopSessionStore):
             turn_count=turn_count,
             pending_approval=pending_approval,
             claude_counted=claude_counted,
+            premium_user_billed=premium_user_billed,
             notification_destinations=notification_destinations,
             auto_approval_enabled=auto_approval_enabled,
             auto_approval_cost_cap_usd=auto_approval_cost_cap_usd,
@@ -278,6 +285,11 @@ class MongoSessionStore(NoopSessionStore):
             if ops:
                 await self.db.session_messages.bulk_write(ops, ordered=False)
         except PyMongoError as e:
+            # Best-effort by default, but the reaper passes raise_on_error so a
+            # silent message-write failure doesn't let it evict a session whose
+            # latest messages never made it to Mongo.
+            if raise_on_error:
+                raise
             logger.warning("Failed to persist session %s snapshot: %s", session_id, e)
 
     async def load_session(

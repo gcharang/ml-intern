@@ -1,7 +1,7 @@
 """Pydantic models for API requests and responses."""
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -52,7 +52,10 @@ class SubmitRequest(BaseModel):
     """Request to submit user input."""
 
     session_id: str
-    text: str
+    # Cap text size to prevent context-bloat / cost-amplification: a malicious
+    # or runaway client could otherwise attach megabytes that then ride along
+    # in every subsequent turn until /api/compact is called.
+    text: str = Field(..., min_length=1, max_length=100_000)
 
 
 class TruncateRequest(BaseModel):
@@ -102,6 +105,8 @@ class SessionInfo(BaseModel):
     auto_approval: SessionAutoApprovalInfo = Field(
         default_factory=SessionAutoApprovalInfo
     )
+    premium_user_billed: bool = False
+    premium_quota_counted: bool = False
 
 
 class SessionNotificationsRequest(BaseModel):
@@ -115,6 +120,23 @@ class SessionYoloRequest(BaseModel):
 
     enabled: bool
     cost_cap_usd: float | None = Field(default=None, ge=0)
+
+
+class DatasetUploadResponse(BaseModel):
+    """Response for a dataset file uploaded to the Hub."""
+
+    session_id: str
+    repo_id: str
+    repo_type: Literal["dataset"] = "dataset"
+    private: bool = True
+    upload_id: str
+    config_name: str
+    filename: str
+    path_in_repo: str
+    size_bytes: int
+    format: Literal["csv", "json", "jsonl"]
+    hub_url: str
+    load_dataset_snippet: str
 
 
 class HealthResponse(BaseModel):

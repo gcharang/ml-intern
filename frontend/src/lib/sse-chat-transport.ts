@@ -54,6 +54,21 @@ function lastEventKey(sessionId: string): string {
   return `hf-agent-last-event:${sessionId}`;
 }
 
+async function readErrorResponse(response: Response): Promise<string> {
+  const raw = await response.text().catch(() => '');
+  if (!raw) return response.statusText || 'Request failed';
+  try {
+    const data = JSON.parse(raw);
+    const detail = data?.detail;
+    if (typeof detail === 'string') return detail;
+    if (detail?.message && typeof detail.message === 'string') return detail.message;
+    if (detail?.error && typeof detail.error === 'string') return detail.error;
+    return JSON.stringify(detail ?? data);
+  } catch {
+    return raw;
+  }
+}
+
 /** Parse an SSE text stream into AgentEvent objects. */
 function createSSEParserStream(sessionId: string): TransformStream<string, AgentEvent> {
   let buffer = '';
@@ -294,8 +309,8 @@ function createEventToChunkStream(sideChannel: SideChannelCallbacks): TransformS
             useAgentStore.getState().setJobsUpgradeRequired({
               namespace: namespace || null,
               message: namespace
-                ? `Hugging Face Jobs need credits on the "${namespace}" namespace. Add some, then re-run the same job — the agent will pick it back up.`
-                : 'Hugging Face Jobs need credits on this namespace. Add some, then re-run the same job — the agent will pick it back up.',
+                ? `Hugging Face Jobs need credits on the "${namespace}" namespace. Job credits are separate from HF Pro membership; add credits, then re-run the same job.`
+                : 'Hugging Face Jobs need namespace credits, which are separate from HF Pro membership. Add credits, then re-run the same job.',
             });
           }
           break;
@@ -413,15 +428,9 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
       // it can flag the session for the catch-up banner.
       this.sideChannel.onSessionDead(sessionId);
     }
-    if (response.status === 429) {
-      // Premium-model daily quota gate tripped. The prefix is the detection marker
-      // for useAgentChat's onError handler, which surfaces the cap dialog
-      // instead of a generic error banner.
-      throw new Error('CLAUDE_QUOTA_EXHAUSTED');
-    }
     if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Request failed');
-      throw new Error(`Chat request failed: ${response.status} ${errorText}`);
+      const errorText = await readErrorResponse(response);
+      throw new Error(`Chat request failed (${response.status}): ${errorText}`);
     }
 
     if (!response.body) {

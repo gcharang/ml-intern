@@ -91,7 +91,11 @@ def _build_registry() -> None:
     # Sandbox tools come from a factory because they depend on local_mode.
     # Mirrors agent/main.py: ML_INTERN_LOCAL_MODE=1 routes shell/file ops to
     # the local machine instead of HF Sandboxes.
-    local_mode = os.environ.get("ML_INTERN_LOCAL_MODE", "").lower() in ("1", "true", "yes")
+    local_mode = os.environ.get("ML_INTERN_LOCAL_MODE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     if local_mode:
         from agent.tools.local_tools import get_local_tools
 

@@ -29,6 +29,23 @@ import sys
 # Mirror agent/tools/jobs_tool.py::CPU_FLAVORS
 CPU_FLAVORS = ["cpu-basic", "cpu-upgrade"]
 
+# Mirror agent/core/agent_loop.py::_IMMEDIATE_HF_JOB_RUNS (only "run"/"uv" get the
+# CPU/GPU approval split — scheduled runs are gated separately and always prompt)
+# and agent/tools/sandbox_tool.py::DEFAULT_CPU_SANDBOX_HARDWARE (the default CPU
+# sandbox is auto-approved; only non-default hardware needs confirmation).
+IMMEDIATE_HF_JOB_RUNS = ("run", "uv")
+DEFAULT_CPU_SANDBOX_HARDWARE = "cpu-basic"
+
+
+def _normalize_operation(operation) -> str:
+    """Mirror agent/core/approval_policy.py::normalize_tool_operation."""
+    return str(operation or "").strip().lower()
+
+
+def _is_scheduled_operation(operation) -> bool:
+    """Mirror agent/core/approval_policy.py::is_scheduled_operation."""
+    return _normalize_operation(operation).startswith("scheduled ")
+
 
 def _env_flag(name: str, default: bool) -> bool:
     val = os.environ.get(name, "").strip().lower()
@@ -57,8 +74,10 @@ def _check_training_script_save_pattern(script: str) -> str | None:
 
 def _hf_jobs_script_warning(tool_input: dict) -> str | None:
     """Extract the script body from an hf_jobs invocation and run save-pattern check."""
-    operation = tool_input.get("operation", "")
-    if operation not in ("run", "uv", "scheduled run", "scheduled uv"):
+    operation = _normalize_operation(tool_input.get("operation"))
+    if operation not in IMMEDIATE_HF_JOB_RUNS and not _is_scheduled_operation(
+        operation
+    ):
         return None
     script = (
         tool_input.get("script")
@@ -70,7 +89,12 @@ def _hf_jobs_script_warning(tool_input: dict) -> str | None:
 
 
 def _needs_approval(tool_name: str, tool_input: dict) -> bool:
-    """Port of agent/core/agent_loop.py::_needs_approval (lines 51-118).
+    """Port of agent/core/agent_loop.py::_needs_approval (+ _base_needs_approval).
+
+    Ordering mirrors the source and is load-bearing: scheduled HF jobs are
+    checked BEFORE the YOLO bypass, because scheduled (recurring/unbounded) jobs
+    always require manual confirmation — even under YOLO. Everything else is
+    bypassed by YOLO, then evaluated by the per-tool rules.
 
     Diverges from source in one place: source short-circuits to False on
     malformed args via `_validate_tool_args` so a downstream validation error
@@ -78,18 +102,34 @@ def _needs_approval(tool_name: str, tool_input: dict) -> bool:
     shape against the MCP schema upstream, so any payload reaching this hook
     is already structurally valid.
     """
+    # MCP tools surface in Claude Code as `mcp__<server>__<tool>`. Strip the prefix.
+    short_name = (
+        tool_name.split("__")[-1] if tool_name.startswith("mcp__") else tool_name
+    )
+
+    # Scheduled HF jobs ALWAYS require approval — even under YOLO. Mirrors
+    # agent_loop._needs_approval, where _is_scheduled_hf_job_run precedes the
+    # config.yolo_mode bypass. (Auto-approving a recurring job is the unsafe
+    # direction for an approval hook.)
+    if short_name == "hf_jobs" and _is_scheduled_operation(tool_input.get("operation")):
+        return True
+
     if _env_flag("ML_INTERN_YOLO", False):
         return False
 
-    # MCP tools surface in Claude Code as `mcp__<server>__<tool>`. Strip the prefix.
-    short_name = tool_name.split("__")[-1] if tool_name.startswith("mcp__") else tool_name
-
     if short_name == "sandbox_create":
-        return True
+        # Only non-default hardware needs approval; the default CPU sandbox is
+        # auto-approved. Mirrors agent_loop._base_needs_approval +
+        # sandbox_tool.DEFAULT_CPU_SANDBOX_HARDWARE.
+        hardware = tool_input.get("hardware") or DEFAULT_CPU_SANDBOX_HARDWARE
+        return hardware != DEFAULT_CPU_SANDBOX_HARDWARE
 
     if short_name == "hf_jobs":
-        operation = tool_input.get("operation", "")
-        if operation not in ("run", "uv", "scheduled run", "scheduled uv"):
+        # Scheduled runs handled above; only immediate "run"/"uv" reach the
+        # CPU/GPU split. Any other operation (logs, cancel, status, ...) is
+        # non-destructive and auto-approved.
+        operation = _normalize_operation(tool_input.get("operation"))
+        if operation not in IMMEDIATE_HF_JOB_RUNS:
             return False
 
         hardware_flavor = (
@@ -116,7 +156,13 @@ def _needs_approval(tool_name: str, tool_input: dict) -> bool:
 
     if short_name == "hf_repo_git":
         operation = tool_input.get("operation", "")
-        if operation in ("delete_branch", "delete_tag", "merge_pr", "create_repo", "update_repo"):
+        if operation in (
+            "delete_branch",
+            "delete_tag",
+            "merge_pr",
+            "create_repo",
+            "update_repo",
+        ):
             return True
 
     return False
@@ -138,32 +184,70 @@ def main() -> int:
     except json.JSONDecodeError as e:
         # Fail-safe: a malformed payload to an APPROVAL hook must not silently
         # allow the tool. Log to stderr so the failure is inspectable.
-        print(f"[ml-intern] approval hook: malformed stdin ({e}); forcing prompt", file=sys.stderr)
-        print(json.dumps(_ask("ml-intern: approval hook received malformed input — confirm before proceeding")))
+        print(
+            f"[ml-intern] approval hook: malformed stdin ({e}); forcing prompt",
+            file=sys.stderr,
+        )
+        print(
+            json.dumps(
+                _ask(
+                    "ml-intern: approval hook received malformed input — confirm before proceeding"
+                )
+            )
+        )
         return 0
 
     if not isinstance(payload, dict):
-        print(f"[ml-intern] approval hook: stdin is {type(payload).__name__}, expected dict; forcing prompt", file=sys.stderr)
-        print(json.dumps(_ask("ml-intern: approval hook received unexpected input — confirm before proceeding")))
+        print(
+            f"[ml-intern] approval hook: stdin is {type(payload).__name__}, expected dict; forcing prompt",
+            file=sys.stderr,
+        )
+        print(
+            json.dumps(
+                _ask(
+                    "ml-intern: approval hook received unexpected input — confirm before proceeding"
+                )
+            )
+        )
         return 0
 
     tool_name = payload.get("tool_name") or ""
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
-        print(f"[ml-intern] approval hook: tool_input is {type(tool_input).__name__}, expected dict; forcing prompt", file=sys.stderr)
-        print(json.dumps(_ask(f"ml-intern: {tool_name or 'tool'} received non-dict input — confirm before proceeding")))
+        print(
+            f"[ml-intern] approval hook: tool_input is {type(tool_input).__name__}, expected dict; forcing prompt",
+            file=sys.stderr,
+        )
+        print(
+            json.dumps(
+                _ask(
+                    f"ml-intern: {tool_name or 'tool'} received non-dict input — confirm before proceeding"
+                )
+            )
+        )
         return 0
 
     if not tool_name:
-        print("[ml-intern] approval hook: empty tool_name; forcing prompt", file=sys.stderr)
-        print(json.dumps(_ask("ml-intern: approval hook received empty tool_name — confirm before proceeding")))
+        print(
+            "[ml-intern] approval hook: empty tool_name; forcing prompt",
+            file=sys.stderr,
+        )
+        print(
+            json.dumps(
+                _ask(
+                    "ml-intern: approval hook received empty tool_name — confirm before proceeding"
+                )
+            )
+        )
         return 0
 
     needs = _needs_approval(tool_name, tool_input)
 
     # Reliability warnings ride along — surface them by forcing a prompt
     # even when the rule would otherwise auto-approve.
-    short_name = tool_name.split("__")[-1] if tool_name.startswith("mcp__") else tool_name
+    short_name = (
+        tool_name.split("__")[-1] if tool_name.startswith("mcp__") else tool_name
+    )
     warning: str | None = None
     if short_name == "hf_jobs":
         warning = _hf_jobs_script_warning(tool_input)

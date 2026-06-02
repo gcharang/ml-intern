@@ -115,6 +115,20 @@ Submit any HF Job (training, eval, batch inference, data prep). Refuses to call 
 
 ---
 
+## Session management
+
+The standalone `ml-intern` TUI added `/resume`, `/clear`, and `/new` (upstream PRs #233, #256). **Inside Claude Code you do not need ml-intern versions of these — Claude Code already provides the first two natively, and `/new` maps onto the native `/clear`.** Defining `.claude/commands/{clear,resume}.md` would shadow the built-ins, so this repo intentionally ships none.
+
+| ml-intern CLI command | What it does in the standalone TUI | Claude Code equivalent |
+|---|---|---|
+| `/clear` | Reset to a fresh chat and wipe the terminal screen (`agent/main.py` → `OpType.NEW`, `clear_screen=True`). | Built-in **`/clear`** — clears conversation history and frees the context window. |
+| `/new` | Reset to a fresh chat but keep terminal scrollback (`OpType.NEW`, `clear_screen=False`). | Built-in **`/clear`** — Claude Code has no separate `/new`; the scrollback-vs-wipe distinction is a TUI detail that doesn't apply here. |
+| `/resume [index\|id\|path]` | Reload a saved transcript from `./session_logs`, by 1-based index, session-id prefix, or path; bare `/resume` opens an interactive picker (`agent/core/session_resume.py`). | Built-in **`/resume`** — pick a prior conversation to continue. From the shell: `claude --resume` (or `claude -c` to continue the most recent). |
+
+Storage differs between the two frontends: the standalone CLI's `/resume` reads its own JSON transcripts under `./session_logs` (`agent/core/session.py` `DEFAULT_SESSION_LOG_DIR`), while Claude Code's `/resume` reads Claude Code's own conversation history — a separate store. They do not share transcripts. (For the CLI-only local JSONL trajectory and the `backend/`+`frontend/` web UI for browsing past sessions, see "When to use the standalone CLI instead" below.)
+
+---
+
 ## Approvals — what to expect
 
 ml-intern's approval policy is enforced via a `PreToolUse` hook (`.claude/hooks/pre_tool_use_approval.py`). Claude Code will prompt you when:
@@ -123,13 +137,14 @@ ml-intern's approval policy is enforced via a `PreToolUse` hook (`.claude/hooks/
 |---|---|
 | `hf_jobs` (run/uv) on **GPU hardware** | Always |
 | `hf_jobs` on CPU hardware | When `ML_INTERN_CONFIRM_CPU_JOBS=1` (default) |
+| `hf_jobs` **scheduled** runs (`scheduled run` / `scheduled uv`) | Always — even under `ML_INTERN_YOLO=1` (recurring/unbounded jobs) |
 | `hf_jobs` with a script that has `from_pretrained` but no `push_to_hub` | Always (warning surfaces in the prompt) |
-| `sandbox_create` | Always |
+| `sandbox_create` with **non-default hardware** (anything other than `cpu-basic`) | Always |
 | `hf_repo_files` `upload` / `delete` | Always |
 | `hf_repo_git` destructive ops (delete branch/tag, merge PR, create/update repo) | Always |
-| Anything else | Auto-allowed by static permissions (see `.claude/settings.json`) |
+| Anything else (incl. a default `cpu-basic` `sandbox_create`) | Auto-allowed by static permissions (see `.claude/settings.json`) |
 
-To skip all approvals (e.g. unattended overnight runs): `ML_INTERN_YOLO=1 claude`. **Don't habit-form that.**
+To skip all approvals (e.g. unattended overnight runs): `ML_INTERN_YOLO=1 claude` — note that **scheduled** HF jobs still prompt even then. **Don't habit-form that.**
 
 If the hook crashes or gets a malformed payload, it **fails safe** — forces a prompt rather than silently allowing.
 

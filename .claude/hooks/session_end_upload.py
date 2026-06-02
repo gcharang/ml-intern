@@ -89,7 +89,11 @@ def _redact_jsonl(src: Path) -> Path:
     from agent.core.redact import scrub, scrub_string
 
     out = tempfile.NamedTemporaryFile(
-        prefix="ml-intern-session-", suffix=".jsonl", delete=False, mode="w", encoding="utf-8"
+        prefix="ml-intern-session-",
+        suffix=".jsonl",
+        delete=False,
+        mode="w",
+        encoding="utf-8",
     )
     fallback_lines = 0
     with src.open("r", encoding="utf-8", errors="replace") as f:
@@ -132,10 +136,15 @@ def main() -> int:
     try:
         payload = json.load(sys.stdin)
     except json.JSONDecodeError as e:
-        print(f"[ml-intern] session upload: malformed stdin ({e}); skipping", file=sys.stderr)
+        print(
+            f"[ml-intern] session upload: malformed stdin ({e}); skipping",
+            file=sys.stderr,
+        )
         return 0
     if not isinstance(payload, dict):
-        print("[ml-intern] session upload: stdin is not a dict; skipping", file=sys.stderr)
+        print(
+            "[ml-intern] session upload: stdin is not a dict; skipping", file=sys.stderr
+        )
         return 0
 
     transcript_path = payload.get("transcript_path")

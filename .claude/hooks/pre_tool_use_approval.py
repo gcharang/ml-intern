@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from typing import Any
 
 # Mirror agent/tools/jobs_tool.py::CPU_FLAVORS
 CPU_FLAVORS = ["cpu-basic", "cpu-upgrade"]
@@ -37,14 +38,19 @@ IMMEDIATE_HF_JOB_RUNS = ("run", "uv")
 DEFAULT_CPU_SANDBOX_HARDWARE = "cpu-basic"
 
 
-def _normalize_operation(operation) -> str:
+def _normalize_operation(operation: Any) -> str:
     """Mirror agent/core/approval_policy.py::normalize_tool_operation."""
     return str(operation or "").strip().lower()
 
 
-def _is_scheduled_operation(operation) -> bool:
+def _is_scheduled_operation(operation: Any) -> bool:
     """Mirror agent/core/approval_policy.py::is_scheduled_operation."""
     return _normalize_operation(operation).startswith("scheduled ")
+
+
+def _short_name(tool_name: str) -> str:
+    """MCP tools surface in Claude Code as `mcp__<server>__<tool>`; strip the prefix."""
+    return tool_name.split("__")[-1] if tool_name.startswith("mcp__") else tool_name
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -101,11 +107,12 @@ def _needs_approval(tool_name: str, tool_input: dict) -> bool:
     surfaces. Here we don't have that path — Claude Code validates input
     shape against the MCP schema upstream, so any payload reaching this hook
     is already structurally valid.
+
+    Mirrors the sync predicate `_needs_approval`; the agent's runtime path is
+    the async `_approval_decision`, whose only extra logic — session-scoped
+    cost-cap budgeting — has no stateless-hook equivalent and is out of scope.
     """
-    # MCP tools surface in Claude Code as `mcp__<server>__<tool>`. Strip the prefix.
-    short_name = (
-        tool_name.split("__")[-1] if tool_name.startswith("mcp__") else tool_name
-    )
+    short_name = _short_name(tool_name)
 
     # Scheduled HF jobs ALWAYS require approval — even under YOLO. Mirrors
     # agent_loop._needs_approval, where _is_scheduled_hf_job_run precedes the
@@ -150,12 +157,12 @@ def _needs_approval(tool_name: str, tool_input: dict) -> bool:
     # rules below cover the same destructive operations on the live tools.
 
     if short_name == "hf_repo_files":
-        operation = tool_input.get("operation", "")
+        operation = _normalize_operation(tool_input.get("operation"))
         if operation in ("upload", "delete"):
             return True
 
     if short_name == "hf_repo_git":
-        operation = tool_input.get("operation", "")
+        operation = _normalize_operation(tool_input.get("operation"))
         if operation in (
             "delete_branch",
             "delete_tag",
@@ -245,9 +252,7 @@ def main() -> int:
 
     # Reliability warnings ride along — surface them by forcing a prompt
     # even when the rule would otherwise auto-approve.
-    short_name = (
-        tool_name.split("__")[-1] if tool_name.startswith("mcp__") else tool_name
-    )
+    short_name = _short_name(tool_name)
     warning: str | None = None
     if short_name == "hf_jobs":
         warning = _hf_jobs_script_warning(tool_input)
